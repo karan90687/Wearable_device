@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 
 #include "espnow_comm.h"
 #include "protocol.h"
@@ -20,10 +21,9 @@ static const char *TAG = "sender";
 // MAC addresses — fill in after discovering each ESP's MAC
 // Run once with any code to print MAC, then fill these in
 // Master ESP MAC address
-static const uint8_t MASTER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // TODO: replace with actual master MAC
-
+static const uint8_t MASTER_MAC[6] = {0x9C, 0x13, 0x9E, 0x90, 0xC6, 0xE0};
 // Peer sender MAC address (the other sender)
-static const uint8_t PEER_SENDER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // TODO: replace with other sender MAC
+static const uint8_t PEER_SENDER_MAC[6] = {0x14, 0x2B, 0x2F, 0xC0, 0x68, 0xE0};  // TODO: replace with other sender MAC
 
 // Latest RSSI from peer sender
 static volatile int8_t peer_rssi = -127;

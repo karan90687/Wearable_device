@@ -21,9 +21,8 @@ typedef struct {
 } received_data_t;
 
 // MAC addresses of senders — fill in after discovering MACs
-static const uint8_t SENDER1_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // TODO: replace
-static const uint8_t SENDER2_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // TODO: replace
-
+static const uint8_t SENDER1_MAC[6] = {0xC0, 0xCD, 0xD6, 0xCE, 0x27, 0x58};  // TODO: replace
+static const uint8_t SENDER2_MAC[6] = {0x14, 0x2B, 0x2F, 0xC0, 0x68, 0xE0};
 // ESP-NOW receive callback
 static void on_data_received(const uint8_t *src_mac, const uint8_t *data,
                               int data_len, int rssi)
@@ -36,6 +35,13 @@ static void on_data_received(const uint8_t *src_mac, const uint8_t *data,
         received_data_t rx = {0};
         memcpy(&rx.packet, data, sizeof(sensor_packet_t));
         rx.rssi = rssi;
+
+        // Override node_id based on source MAC address
+        if (memcmp(src_mac, SENDER1_MAC, 6) == 0) {
+            rx.packet.node_id = 1;
+        } else if (memcmp(src_mac, SENDER2_MAC, 6) == 0) {
+            rx.packet.node_id = 2;
+        }
 
         // Send to queue (don't block in ISR-like callback)
         xQueueSendFromISR(data_queue, &rx, NULL);
