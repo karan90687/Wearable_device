@@ -1,0 +1,26 @@
+# ESP-IDF specific
+build/
+managed_components/
+dependencies.lock
+sdkconfig.old
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Python dashboard specific
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+.env
+
+# MacOS specific
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+.cache/
+.clangd/
+*.swp

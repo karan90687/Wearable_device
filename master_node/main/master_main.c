@@ -22,7 +22,7 @@ typedef struct {
 
 // MAC addresses of senders — fill in after discovering MACs
 static const uint8_t SENDER1_MAC[6] = {0xC0, 0xCD, 0xD6, 0xCE, 0x27, 0x58};  // TODO: replace
-static const uint8_t SENDER2_MAC[6] = {0x14, 0x2B, 0x2F, 0xC0, 0x68, 0xE0};
+// static const uint8_t SENDER2_MAC[6] = {0x14, 0x2B, 0x2F, 0xC0, 0x68, 0xE0};
 // ESP-NOW receive callback
 static void on_data_received(const uint8_t *src_mac, const uint8_t *data,
                               int data_len, int rssi)
@@ -37,10 +37,13 @@ static void on_data_received(const uint8_t *src_mac, const uint8_t *data,
         rx.rssi = rssi;
 
         // Override node_id based on source MAC address
+        // if (memcmp(src_mac, SENDER1_MAC, 6) == 0) {
+        //     rx.packet.node_id = 1;
+        // } else if (memcmp(src_mac, SENDER2_MAC, 6) == 0) {
+        //     rx.packet.node_id = 2;
+        // }
         if (memcmp(src_mac, SENDER1_MAC, 6) == 0) {
             rx.packet.node_id = 1;
-        } else if (memcmp(src_mac, SENDER2_MAC, 6) == 0) {
-            rx.packet.node_id = 2;
         }
 
         // Send to queue (don't block in ISR-like callback)
@@ -67,14 +70,14 @@ static void serial_output_task(void *pvParameters)
                    rx.packet.rssi_peer,
                    rx.rssi);
 
-            ESP_LOGI(TAG, "Node %d: HR=%.1f SpO2=%.1f BTemp=%.1f ETemp=%.1f Gas=%.1f RSSI_peer=%d",
-                     rx.packet.node_id,
-                     rx.packet.heart_rate,
-                     rx.packet.spo2,
-                     rx.packet.body_temp,
-                     rx.packet.env_temp,
-                     rx.packet.gas_ppm,
-                     rx.packet.rssi_peer);
+            // ESP_LOGI(TAG, "Node %d: HR=%.1f SpO2=%.1f BTemp=%.1f ETemp=%.1f Gas=%.1f RSSI_peer=%d",
+            //          rx.packet.node_id,
+            //          rx.packet.heart_rate,
+            //          rx.packet.spo2,
+            //          rx.packet.body_temp,
+            //          rx.packet.env_temp,
+            //          rx.packet.gas_ppm,
+            //          rx.packet.rssi_peer);
         }
     }
 }
@@ -95,7 +98,7 @@ void app_main(void)
 
     // Add sender peers
     espnow_comm_add_peer(SENDER1_MAC);
-    espnow_comm_add_peer(SENDER2_MAC);
+    // espnow_comm_add_peer(SENDER2_MAC);
 
     // Start serial output task
     xTaskCreate(serial_output_task, "serial_out", 4096, NULL, 5, NULL);
