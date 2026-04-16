@@ -24,7 +24,7 @@ MAC Address: C0:CD:D6:CE:27:58
 | MAX30102 | I2C | Heart rate, SpO2 |
 | MAX30205 | I2C | Body temperature |
 | MQ-135 | ADC | Air quality (gas PPM) |
-| DS18B20 | OneWire (GPIO) | Environment temperature |
+| TMP117 | OneWire (GPIO) | Environment temperature |
 
 ## Architecture
 ```
@@ -52,7 +52,7 @@ fyp/
 │       ├── max30102/              # Heart rate & SpO2 (I2C)
 │       ├── max30205/              # Body temp (I2C)
 │       ├── mq135/                 # Gas sensor (ADC)
-│       ├── ds18b20/               # Env temp (OneWire)
+│       ├── tmp117/               # Env temp (OneWire)
 │       └── buzzer/                # Buzzer (GPIO)
 ├── master_node/                   # Firmware for master/receiver ESP
 │   └── main/                      # master_main.c (app_main)
@@ -77,7 +77,7 @@ fyp/
 - MAX30102 driver (I2C — HR/SpO2 algorithm)
 - MAX30205 driver (I2C — temperature register read)
 - MQ-135 driver (ADC — voltage to PPM conversion)
-- DS18B20 driver (OneWire — bit-bang protocol)
+- TMP117 driver (OneWire — bit-bang protocol)
 - Integrate into sender_main.c
 - **Test:** Real sensor values appear on master serial
 
@@ -112,7 +112,7 @@ fyp/
 | I2C SDA (MAX30102, MAX30205) | GPIO 21 |
 | I2C SCL (MAX30102, MAX30205) | GPIO 22 |
 | MQ-135 analog out | GPIO 34 (ADC1_CH6) |
-| DS18B20 data | GPIO 4 |
+| TMP117 data | GPIO 4 |
 | Buzzer | GPIO 5 |
 
 ## Notes
