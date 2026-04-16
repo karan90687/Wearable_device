@@ -5,9 +5,12 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
-
 #include "espnow_comm.h"
 #include "protocol.h"
+#include "i2c.h"
+#include "max30102.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "sender";
 
@@ -87,8 +90,41 @@ static void ping_task(void *pvParameters)
     }
 }
 
+static void spo2_task(void *pvParameters)
+{
+    if (max30102_init() != ESP_OK) {
+        printf("Init failed\n");
+        vTaskDelete(NULL);
+    }
+
+    moving_avg_filter_t ir_filter;
+    moving_avg_filter_t red_filter;
+
+    filter_init(&ir_filter);
+    filter_init(&red_filter);
+
+    while (1)
+    {
+        max30102_sample_t sample;
+
+        if (max30102_read_sample(&sample) == ESP_OK)
+        {
+            uint32_t filtered_ir  = filter_update(&ir_filter, sample.ir);
+            uint32_t filtered_red = filter_update(&red_filter, sample.red);
+
+            printf("IR Raw: %lu Filtered: %lu | RED Raw: %lu Filtered: %lu\n",
+                   sample.ir, filtered_ir,
+                   sample.red, filtered_red);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); // avoid CPU hog
+    }
+}
+
 void app_main(void)
 {
+    // Initialize I2C
+    ESP_ERROR_CHECK(i2c_init());
     ESP_LOGI(TAG, "=== Sender Node %d Starting ===", NODE_ID);
 
     // Initialize ESP-NOW

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "max30205.c"
+    SRCS "tmp117.c"
     INCLUDE_DIRS "include"
     REQUIRES driver
 )

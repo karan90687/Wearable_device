@@ -6,12 +6,10 @@
 
 static const char *TAG = "max30102";
 
-
 // forward declarations of helper functions
 esp_err_t max30102_read_reg(uint8_t reg, uint8_t *data, size_t len);
 esp_err_t max30102_write_reg(uint8_t reg, uint8_t data);
 esp_err_t max30102_read_sample(max30102_sample_t *sample);
-esp_err_t reset_registers();
 esp_err_t reset_registers();
 esp_err_t fifo_configure(uint8_t samples);
 esp_err_t spo2_configure(uint8_t adc, uint8_t sr, uint8_t pw);
@@ -42,9 +40,9 @@ esp_err_t max30102_check_device()
 esp_err_t max30102_init()
 {
     // device check 
-    reti = max30102_check_device();
-if (reti != ESP_OK) return reti;
+esp_err_t reti = max30102_check_device();if (reti != ESP_OK) return reti;
     // Step 1: reset : we will set the reset bit high
+
 esp_err_t ret;
 ret = reset_registers();
 if (ret != ESP_OK) return ret;    
@@ -61,6 +59,7 @@ if (ret != ESP_OK) return ret;
     // Step 5: set mode
     set_mode_spo2();     // 0x03 = 0000 0011 → SpO2 mode, sensor ON, normal operation
 
+    
     // Step 6: clear FIFO
     reset_fifo();
 ESP_LOGI(TAG, "MAX30102 initialized successfully");
@@ -90,6 +89,7 @@ for now Set to default (0 or small value) as we are not using interrupts
     if (ret != ESP_OK) return ret;   
     // max30102_write_reg(0x08, 0x78);     // 0x78 = 0111 1000 -> 8 samples, rollover enabled, A_FULL = 0
     // max30102_write_reg(0x08, 0x50);     // 0x50 = 0101 0000 -> 4 samples, rollover enabled, A_FULL = 0
+    return ESP_OK;
 }
 
 esp_err_t spo2_configure(uint8_t adc, uint8_t sr, uint8_t pw){
@@ -117,16 +117,16 @@ Controls: Resolution Measurement-time {69,118,215,411} µs.     high resolution 
 [ADC_RGE][SR][PW]
    01      011  11
 */
-    uint8_t value = (adc_range << 5) | (sample_rate << 2) | pulse_width;
+uint8_t value = (adc << 5) | (sr << 2) | pw;
     int ret = max30102_write_reg(0x0A, value);     // 0x5F = 0101 1111 -> ADC range = 4096 nA, sample rate = 100 Hz, pulse width = 411 µs
     if (ret != ESP_OK) return ret;
+    return ESP_OK;
 
 }
 
 esp_err_t reset_registers()
 {
             // whenever we write to the registers, remember this rule Read → modify → write
-
     uint8_t value;
     esp_err_t ret;
 
@@ -169,7 +169,9 @@ IR  = 0x24 → ~7 mA
     if (ret != ESP_OK) return ret;
     ret = max30102_write_reg(0x0D, ir_current);      // LED2_PA (IR)
     if (ret != ESP_OK) return ret;
+    return ESP_OK;
 }
+
 /*
     | Mode Value | Name            | What it does            |
 | ---------- | --------------- | ----------------------- |
@@ -297,4 +299,35 @@ esp_err_t max30102_read_sample(max30102_sample_t *sample)
 
     return ESP_OK;
 }
+
+void filter_init(moving_avg_filter_t *f)
+{
+    memset(f->buffer, 0, sizeof(f->buffer));
+    f->sum = 0;
+    f->index = 0;
+    f->count = 0;
+}
+
+uint32_t filter_update(moving_avg_filter_t *f, uint32_t new_value)
+{
+    // remove old value
+    f->sum -= f->buffer[f->index];
+
+    // insert new value
+    f->buffer[f->index] = new_value;
+    f->sum += new_value;
+
+    // move index
+    f->index = (f->index + 1) % FILTER_SIZE;
+
+    // track count (for initial phase)
+    if (f->count < FILTER_SIZE) {
+        f->count++;
+    }
+
+    // return average
+    return f->sum / f->count;
+}
+
+
 
