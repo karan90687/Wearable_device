@@ -11,6 +11,7 @@
 #include "max30102.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "ad8232.h"
 
 static const char *TAG = "sender";
 
@@ -118,6 +119,33 @@ static void spo2_task(void *pvParameters)
         }
 
         vTaskDelay(pdMS_TO_TICKS(10)); // avoid CPU hog
+    }
+}
+
+static void ecg_task(void *pvParameters)
+{
+    if (ad8232_init() != ESP_OK) {
+        printf("AD8232 init failed\n");
+        vTaskDelete(NULL);
+    }
+
+    ad8232_filter_t ecg_filter;
+    ad8232_filter_init(&ecg_filter);
+
+    while (1) {
+        ad8232_sample_t sample;
+
+        if (ad8232_read_sample(&sample) == ESP_OK) {
+            if (sample.leads_off) {
+                printf("ECG: leads off — reattach electrodes\n");
+            } else {
+                uint32_t filtered = ad8232_filter_update(&ecg_filter, sample.raw);
+                printf("ECG raw: %4u  filtered: %4lu\n", sample.raw, filtered);
+                // TODO: feed filtered value into heart rate / QRS detection algorithm
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(3));   // ~333 Hz sample rate
     }
 }
 

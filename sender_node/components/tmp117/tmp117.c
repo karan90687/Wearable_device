@@ -17,7 +17,7 @@ esp_err_t tmp117_init(void)
         ESP_LOGE(TAG, "Device not found or ID mismatch");
         return ret;
     }
-
+vTaskDelay(pdMS_TO_TICKS(20));
     ESP_LOGI(TAG, "TMP117 initialized successfully");
 
 // TMP117 Configuration Register reset value: 0x0220

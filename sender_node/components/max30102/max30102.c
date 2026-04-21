@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
 
 static const char *TAG = "max30102";
 
@@ -51,7 +52,7 @@ if (ret != ESP_OK) return ret;
     fifo_configure(0x50);     // 0x50 = 0101 0000 -> 4 samples, rollover enabled, A_FULL = 0
 
     // Step 3: configure SPO2
-    spo2_configure(0x01, 0x03, 0x03);     // 0x5F = 0101 1111 -> ADC range = 4096 nA, sample rate = 100 Hz, pulse width = 411 µs
+    spo2_configure(0x01, 0x02, 0x03);     // 0x5F = 0101 1111 -> ADC range = 4096 nA, sample rate = 100 Hz, pulse width = 411 µs
 
     // Step 4: set LED current
     set_led_current(0x24, 0x24);     // RED = 0x24 → ~7 mA, IR  = 0x24 → ~7 mA
@@ -126,23 +127,18 @@ uint8_t value = (adc << 5) | (sr << 2) | pw;
 
 esp_err_t reset_registers()
 {
-            // whenever we write to the registers, remember this rule Read → modify → write
-    uint8_t value;
     esp_err_t ret;
+    uint8_t val;
 
-    // Step 1: read current value
-    ret = max30102_read_reg(0x09, &value, 1);
+    // Step 1: set reset bit (bit 6)
+    ret = max30102_write_reg(0x09, (1 << 6));
     if (ret != ESP_OK) return ret;
 
-    // Step 2: set reset bit (bit 6)
-    value |= (1 << 6);
-
-    // Step 3: write back
-    ret = max30102_write_reg(0x09, value);
-    if (ret != ESP_OK) return ret;
-
-    // Step 4: wait for reset
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // Step 2: poll until reset bit clears (auto-cleared by chip)
+    do {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        max30102_read_reg(0x09, &val, 1);
+    } while (val & (1 << 6));
 
     return ESP_OK;
 }
@@ -262,8 +258,14 @@ esp_err_t max30102_write_reg(uint8_t reg, uint8_t data)
     );
 }
 
+
 esp_err_t max30102_read_sample(max30102_sample_t *sample)
 {
+    // NOTE: reads only one sample per call.
+// Caller must invoke this in a loop with task delay ≤ 10ms to keep up with 100Hz sample rate.
+// If called slower than 100Hz, FIFO will accumulate samples and rollover will silently overwrite old data.
+// TODO: replace with burst read (Option A) if data loss is observed.
+
     uint8_t wr, rd;
     uint8_t buffer[6];
     esp_err_t ret;
