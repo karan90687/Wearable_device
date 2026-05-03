@@ -6,7 +6,10 @@
 
 static const char *TAG = "tmp117";
 
-#define tmp117_I2C_ADDR 0x48    // TODO : check the address wiht sensor also 
+#define TMP117_I2C_ADDR 0x48    // TODO : check the address wiht sensor also
+
+static esp_err_t tmp117_read_reg(uint8_t reg, uint8_t *data, size_t len);
+static esp_err_t tmp117_write_reg(uint8_t reg, uint16_t data);
 
 esp_err_t tmp117_init(void)
 {

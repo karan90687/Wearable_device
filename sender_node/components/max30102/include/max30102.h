@@ -1,6 +1,7 @@
 #ifndef MAX30102_H
 #define MAX30102_H
 
+#include <stdint.h>
 #include "esp_err.h"
 
 #define MAX30102_I2C_ADDR   0x57
@@ -24,5 +25,9 @@ esp_err_t max30102_init();
 // Read heart rate (BPM) and SpO2 (%) values
 // Returns ESP_OK on success, values written to pointers
 esp_err_t max30102_read_sample(max30102_sample_t *sample);
+
+// Moving-average filter helpers (definitions live in max30102.c)
+void     filter_init(moving_avg_filter_t *f);
+uint32_t filter_update(moving_avg_filter_t *f, uint32_t new_value);
 
 #endif // MAX30102_H

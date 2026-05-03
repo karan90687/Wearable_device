@@ -2,167 +2,288 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "esp_random.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+
 #include "espnow_comm.h"
 #include "protocol.h"
 #include "i2c.h"
-#include "max30102.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include "ad8232.h"
 
 static const char *TAG = "sender";
 
 // ============================================================
-// CONFIGURATION — Change NODE_ID per device before flashing
-// Sender 1: NODE_ID = NODE_ID_SENDER_1 (1)
-// Sender 2: NODE_ID = NODE_ID_SENDER_2 (2)
+// CONFIGURATION
+// Sender 1: NODE_ID = NODE_ID_SENDER_1
+// Sender 2 (future): NODE_ID = NODE_ID_SENDER_2 — only line that changes
 // ============================================================
 #define NODE_ID  NODE_ID_SENDER_1
 
-// MAC addresses — fill in after discovering each ESP's MAC
-// Run once with any code to print MAC, then fill these in
-// Master ESP MAC address
+// Pin map (per project pin spec)
+#define PIN_LED_STATUS   GPIO_NUM_15   // active-high, 220Ω series
+#define PIN_LED_ALERT    GPIO_NUM_26   // unused in Stage 2 (alarms in Stage 6)
+#define PIN_BUZZER       GPIO_NUM_27   // active buzzer — drive HIGH to beep
+#define PIN_AD8232_SDN   GPIO_NUM_4    // chip-enable for AD8232 (HIGH = on)
+
+// Master ESP MAC — hardcoded
 static const uint8_t MASTER_MAC[6] = {0x9C, 0x13, 0x9E, 0x90, 0xC6, 0xE0};
-// Peer sender MAC address (the other sender)
-// static const uint8_t PEER_SENDER_MAC[6] = {0x14, 0x2B, 0x2F, 0xC0, 0x68, 0xE0};  // TODO: replace with other sender MAC
 
-// Latest RSSI from peer sender
-static volatile int8_t peer_rssi = -127;
+// Liveness timeout: if we don't hear from master for this long, drop to IDLE
+#define MASTER_TIMEOUT_MS   3000
+#define HEARTBEAT_PERIOD_MS 1000
+#define VITALS_PERIOD_MS    500
 
-// ESP-NOW receive callback
+// ============================================================
+// FSM
+// ============================================================
+typedef enum {
+    SENDER_IDLE = 0,    // waiting for HELLO from master
+    SENDER_CONNECTED,   // handshake done, awaiting CMD_START
+    SENDER_STREAMING,   // pushing vitals every VITALS_PERIOD_MS
+} sender_state_t;
+
+static volatile sender_state_t s_state = SENDER_IDLE;
+
+// Single-millisecond clock used for liveness tracking. uint32_t reads/writes
+// are atomic on ESP32, so no mutex needed across the recv callback / FSM.
+static volatile uint32_t s_last_master_seen_ms = 0;
+
+typedef enum {
+    EV_RX_HELLO,
+    EV_RX_CMD_START,
+    EV_RX_CMD_STOP,
+    EV_RX_HEARTBEAT,
+} sender_event_t;
+
+static QueueHandle_t event_queue = NULL;
+
+static inline uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// ============================================================
+// LED + buzzer helpers
+// ============================================================
+static void led_set(bool on)      { gpio_set_level(PIN_LED_STATUS, on ? 1 : 0); }
+static void buzzer_set(bool on)   { gpio_set_level(PIN_BUZZER,     on ? 1 : 0); }
+
+// Single 200 ms pulse — used on entering CONNECTED.
+static void led_blink_once(void)
+{
+    led_set(true);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    led_set(false);
+}
+
+// Two beeps separated by 200 ms — connect indicator.
+static void buzzer_beep_twice(void)
+{
+    buzzer_set(true);  vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_set(false); vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_set(true);  vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_set(false);
+}
+
+// ============================================================
+// ESP-NOW helpers
+// ============================================================
+static void send_ctrl(uint8_t packet_type)
+{
+    ctrl_packet_t pkt = { .packet_type = packet_type, .node_id = NODE_ID };
+    espnow_comm_send(MASTER_MAC, (const uint8_t *)&pkt, sizeof(pkt));
+}
+
+// ============================================================
+// ESP-NOW receive callback — runs in WiFi task context
+// ============================================================
 static void on_data_received(const uint8_t *src_mac, const uint8_t *data,
                               int data_len, int rssi)
 {
+    (void)src_mac; (void)rssi;
     if (data_len < 1) return;
 
-    uint8_t packet_type = data[0];
-
-    if (packet_type == PACKET_TYPE_PING && data_len >= sizeof(ping_packet_t)) {
-        // Received ping from peer sender — store RSSI
-        peer_rssi = (int8_t)rssi;
-        ESP_LOGI(TAG, "Ping from " MACSTR " RSSI=%d", MAC2STR(src_mac), rssi);
+    sender_event_t ev;
+    bool          post = true;
+    switch (data[0]) {
+        case PACKET_TYPE_HELLO:     ev = EV_RX_HELLO;     break;
+        case PACKET_TYPE_CMD_START: ev = EV_RX_CMD_START; break;
+        case PACKET_TYPE_CMD_STOP:  ev = EV_RX_CMD_STOP;  break;
+        case PACKET_TYPE_HEARTBEAT: ev = EV_RX_HEARTBEAT; break;
+        default:                    post = false;         break;
+    }
+    if (post) {
+        s_last_master_seen_ms = now_ms();
+        xQueueSend(event_queue, &ev, 0);
     }
 }
 
-// Task: periodically read sensors and send data to master
-static void sensor_send_task(void *pvParameters)
+// ============================================================
+// State transitions
+// ============================================================
+static void enter_idle(void)
 {
-    sensor_packet_t packet = {0};
-    packet.packet_type = PACKET_TYPE_SENSOR_DATA;
-    packet.node_id = NODE_ID;
+    s_state = SENDER_IDLE;
+    led_set(false);
+    ESP_LOGI(TAG, "→ IDLE");
+}
+
+static void enter_connected_from_hello(void)
+{
+    // Reply READY first so master leaves CONNECTING ASAP, then do the
+    // user-facing LED + buzzer indication.
+    send_ctrl(PACKET_TYPE_READY);
+    s_state = SENDER_CONNECTED;
+    ESP_LOGI(TAG, "→ CONNECTED (HELLO ack'd)");
+    led_blink_once();
+    buzzer_beep_twice();
+}
+
+static void enter_streaming(void)
+{
+    s_state = SENDER_STREAMING;
+    led_set(true);
+    ESP_LOGI(TAG, "→ STREAMING");
+}
+
+static void enter_connected_from_streaming(void)
+{
+    s_state = SENDER_CONNECTED;
+    led_set(false);
+    ESP_LOGI(TAG, "→ CONNECTED (stop)");
+}
+
+// ============================================================
+// State task — single consumer of the event queue.
+// Polls every 100 ms so it can also detect master heartbeat timeout.
+// ============================================================
+static void state_task(void *pv)
+{
+    s_last_master_seen_ms = now_ms();
 
     while (1) {
-        // ---- Stage 1: Dummy data (replace with real sensor reads in Stage 2) ----
-        packet.heart_rate = 72.0f + (float)(esp_random() % 10);
-        packet.spo2       = 95.0f + (float)(esp_random() % 5);
-        packet.body_temp  = 36.5f + (float)(esp_random() % 10) / 10.0f;
-        packet.env_temp   = 24.0f + (float)(esp_random() % 5);
-        packet.gas_ppm    = 100.0f + (float)(esp_random() % 50);
-        packet.rssi_peer  = peer_rssi;
+        sender_event_t ev;
+        if (xQueueReceive(event_queue, &ev, pdMS_TO_TICKS(100)) == pdTRUE) {
+            switch (ev) {
+            case EV_RX_HELLO:
+                if (s_state == SENDER_IDLE) {
+                    enter_connected_from_hello();
+                } else {
+                    // Already connected — just re-ack so master settles.
+                    send_ctrl(PACKET_TYPE_READY);
+                }
+                break;
 
-        // Send sensor data to master
-        esp_err_t ret = espnow_comm_send(MASTER_MAC, (uint8_t *)&packet, sizeof(packet));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send sensor data: %d", ret);
-        } else {
-            ESP_LOGI(TAG, "Sent: HR=%.1f SpO2=%.1f BTemp=%.1f ETemp=%.1f Gas=%.1f RSSI=%d",
-                     packet.heart_rate, packet.spo2, packet.body_temp,
-                     packet.env_temp, packet.gas_ppm, packet.rssi_peer);
-        }
+            case EV_RX_CMD_START:
+                if (s_state == SENDER_CONNECTED) enter_streaming();
+                break;
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
+            case EV_RX_CMD_STOP:
+                if (s_state == SENDER_STREAMING) enter_connected_from_streaming();
+                break;
 
-// Task: periodically send ping to peer sender for RSSI measurement
-static void ping_task(void *pvParameters)
-{
-    ping_packet_t ping = {
-        .packet_type = PACKET_TYPE_PING,
-        .node_id = NODE_ID,
-    };
-
-    while (1) {
-        espnow_comm_send(PEER_SENDER_MAC, (uint8_t *)&ping, sizeof(ping));
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-static void spo2_task(void *pvParameters)
-{
-    if (max30102_init() != ESP_OK) {
-        printf("Init failed\n");
-        vTaskDelete(NULL);
-    }
-
-    moving_avg_filter_t ir_filter;
-    moving_avg_filter_t red_filter;
-
-    filter_init(&ir_filter);
-    filter_init(&red_filter);
-
-    while (1)
-    {
-        max30102_sample_t sample;
-
-        if (max30102_read_sample(&sample) == ESP_OK)
-        {
-            uint32_t filtered_ir  = filter_update(&ir_filter, sample.ir);
-            uint32_t filtered_red = filter_update(&red_filter, sample.red);
-
-            printf("IR Raw: %lu Filtered: %lu | RED Raw: %lu Filtered: %lu\n",
-                   sample.ir, filtered_ir,
-                   sample.red, filtered_red);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10)); // avoid CPU hog
-    }
-}
-
-static void ecg_task(void *pvParameters)
-{
-    if (ad8232_init() != ESP_OK) {
-        printf("AD8232 init failed\n");
-        vTaskDelete(NULL);
-    }
-
-    ad8232_filter_t ecg_filter;
-    ad8232_filter_init(&ecg_filter);
-
-    while (1) {
-        ad8232_sample_t sample;
-
-        if (ad8232_read_sample(&sample) == ESP_OK) {
-            if (sample.leads_off) {
-                printf("ECG: leads off — reattach electrodes\n");
-            } else {
-                uint32_t filtered = ad8232_filter_update(&ecg_filter, sample.raw);
-                printf("ECG raw: %4u  filtered: %4lu\n", sample.raw, filtered);
-                // TODO: feed filtered value into heart rate / QRS detection algorithm
+            case EV_RX_HEARTBEAT:
+                // s_last_master_seen_ms already bumped in callback
+                break;
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(3));   // ~333 Hz sample rate
+        // Periodic tick — master liveness check
+        if (s_state != SENDER_IDLE) {
+            uint32_t age = now_ms() - s_last_master_seen_ms;
+            if (age > MASTER_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "master timeout (%u ms) — dropping to IDLE", age);
+                enter_idle();
+            }
+        }
     }
+}
+
+// ============================================================
+// Heartbeat TX — sender → master, only while CONNECTED.
+// Suppressed during STREAMING (vitals packets prove liveness).
+// ============================================================
+static void heartbeat_tx_task(void *pv)
+{
+    while (1) {
+        if (s_state == SENDER_CONNECTED) {
+            send_ctrl(PACKET_TYPE_HEARTBEAT);
+        }
+        vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS));
+    }
+}
+
+// ============================================================
+// Vitals TX — only fires while STREAMING.
+// Stage 2 still uses dummy values; real sensor wiring is Stage 3.
+// ============================================================
+static void vitals_tx_task(void *pv)
+{
+    sensor_packet_t pkt = {
+        .packet_type = PACKET_TYPE_SENSOR_DATA,
+        .node_id     = NODE_ID,
+    };
+    while (1) {
+        if (s_state == SENDER_STREAMING) {
+            pkt.heart_rate = 72.0f + (float)(esp_random() % 10);
+            pkt.spo2       = 95.0f + (float)(esp_random() % 5);
+            pkt.body_temp  = 36.5f + (float)(esp_random() % 10) / 10.0f;
+            pkt.env_temp   = 24.0f + (float)(esp_random() % 5);
+            pkt.gas_ppm    = 100.0f + (float)(esp_random() % 50);
+            pkt.rssi_peer  = -127;
+            espnow_comm_send(MASTER_MAC, (const uint8_t *)&pkt, sizeof(pkt));
+        }
+        vTaskDelay(pdMS_TO_TICKS(VITALS_PERIOD_MS));
+    }
+}
+
+// ============================================================
+// Peripheral init
+// ============================================================
+static void peripherals_init(void)
+{
+    gpio_reset_pin(PIN_LED_STATUS);
+    gpio_set_direction(PIN_LED_STATUS, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_LED_STATUS, 0);
+
+    gpio_reset_pin(PIN_LED_ALERT);
+    gpio_set_direction(PIN_LED_ALERT, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_LED_ALERT, 0);
+
+    gpio_reset_pin(PIN_BUZZER);
+    gpio_set_direction(PIN_BUZZER, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_BUZZER, 0);
+
+    // AD8232 SDN tied to GPIO 4 — must be HIGH for the analog front-end
+    // to operate. Stage 3 will actually read the ADC; we enable the chip
+    // here so it's stable by then.
+    gpio_reset_pin(PIN_AD8232_SDN);
+    gpio_set_direction(PIN_AD8232_SDN, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_AD8232_SDN, 1);
+
+    ESP_ERROR_CHECK(i2c_init());
 }
 
 void app_main(void)
 {
-    // Initialize I2C
-    ESP_ERROR_CHECK(i2c_init());
     ESP_LOGI(TAG, "=== Sender Node %d Starting ===", NODE_ID);
 
-    // Initialize ESP-NOW
+    peripherals_init();
+
+    event_queue = xQueueCreate(16, sizeof(sender_event_t));
+    if (event_queue == NULL) {
+        ESP_LOGE(TAG, "event queue alloc failed");
+        return;
+    }
+
     ESP_ERROR_CHECK(espnow_comm_init(on_data_received));
-
-    // Add peers
     espnow_comm_add_peer(MASTER_MAC);
-    espnow_comm_add_peer(PEER_SENDER_MAC);
 
-    // Start tasks
-    xTaskCreate(sensor_send_task, "sensor_send", 4096, NULL, 5, NULL);
-    xTaskCreate(ping_task, "ping", 2048, NULL, 4, NULL);
+    xTaskCreate(state_task,        "state",     4096, NULL, 5, NULL);
+    xTaskCreate(heartbeat_tx_task, "hb_tx",     2048, NULL, 4, NULL);
+    xTaskCreate(vitals_tx_task,    "vitals_tx", 4096, NULL, 4, NULL);
+
+    ESP_LOGI(TAG, "Sender ready, waiting for HELLO from master");
 }

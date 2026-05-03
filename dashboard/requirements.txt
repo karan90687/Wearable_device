@@ -1,1 +1,15 @@
+# Dashboard runtime dependencies
+# Install with:  pip install -r requirements.txt
+
+# Serial I/O — read JSON lines from the master ESP and write commands back
 pyserial>=3.5
+
+# Numerical + signal processing for HR / SpO2 / ECG analysis (Stage 3+)
+numpy>=1.24
+scipy>=1.10
+
+# Live ECG waveform plotting in the Tk dashboard (Stage 4)
+matplotlib>=3.7
+
+# NOTE: tkinter is part of the Python standard library on Windows/macOS.
+# On Debian/Ubuntu install it system-wide:  sudo apt install python3-tk
