@@ -1,0 +1,31 @@
+```mermaid
+flowchart TB
+    subgraph S["Sender Node — ESP32 DevKit V1"]
+        direction TB
+        S_SENS["Sensors\nMAX30102 · TMP117 · AD8232"]
+        S_LED["Status LED · Buzzer\nGPIO 15 / GPIO 27"]
+        S_FW["Firmware\nFSM · sensor tasks · ESP-NOW TX"]
+        S_SENS --> S_FW
+        S_LED --> S_FW
+    end
+
+    subgraph M["Master Node — ESP32 DevKit V1"]
+        direction TB
+        M_FW["Firmware\nFSM · UART bridge · JSON output"]
+        M_LED["Onboard LED\nGPIO 2"]
+        M_FW --> M_LED
+    end
+
+    subgraph L["Laptop"]
+        direction TB
+        SR["serial_reader.py\ndata_queue · raw_queue"]
+        GUI["gui.py — DashboardGUI\nTk · matplotlib · 100 ms tick"]
+        LOG["Session Recorder\nvitals_*.csv · ecg_*.csv"]
+        SR --> GUI
+        SR --> LOG
+        GUI --> LOG
+    end
+
+    S_FW <-- "ESP-NOW · 2.4 GHz · RSSI tracked" --> M_FW
+    M_FW <-- "USB Serial · 115200 baud · line-delimited JSON" --> SR
+```

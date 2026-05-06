@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -22,7 +23,8 @@ static const char *TAG = "master";
 // ============================================================
 // Hardcoded peer MACs (1-sender prototype)
 // ============================================================
-static const uint8_t SENDER1_MAC[6] = {0xC0, 0xCD, 0xD6, 0xCE, 0x27, 0x58};
+// Sender ESP MAC — E0:8C:FE:32:DD:14
+static const uint8_t SENDER1_MAC[6] = {0xE0, 0x8C, 0xFE, 0x32, 0xDD, 0x14};
 // static const uint8_t SENDER2_MAC[6] = {0x14, 0x2B, 0x2F, 0xC0, 0x68, 0xE0};  // Stage 5
 
 // ============================================================
@@ -32,6 +34,8 @@ static const uint8_t SENDER1_MAC[6] = {0xC0, 0xCD, 0xD6, 0xCE, 0x27, 0x58};
 #define CONNECTING_EMIT_MS  1000   // emit "connecting" status at most once per 1 s
 #define HEARTBEAT_TX_MS     1000   // master → sender heartbeat
 #define SENDER_TIMEOUT_MS   3000   // no traffic from sender for this long → disconnect
+#define READY_BEACON_MS     2000   // re-emit "master_ready" while idle so a
+                                    // dashboard that connects mid-flight catches up
 
 // ============================================================
 // FSM
@@ -54,6 +58,7 @@ typedef struct {
 } received_data_t;
 
 static QueueHandle_t data_queue = NULL;
+static QueueHandle_t ecg_queue  = NULL;
 
 // ============================================================
 // Event queue: UART commands + ESP-NOW receives → state task
@@ -132,6 +137,21 @@ static void on_data_received(const uint8_t *src_mac, const uint8_t *data,
         return;
     }
 
+    if (t == PACKET_TYPE_ECG && data_len >= sizeof(ecg_packet_t)) {
+        // Forward ECG straight to the ECG output queue
+        ecg_packet_t pkt;
+        memcpy(&pkt, data, sizeof(pkt));
+        if (memcmp(src_mac, SENDER1_MAC, 6) == 0) {
+            pkt.node_id = NODE_ID_SENDER_1;
+        }
+        xQueueSend(ecg_queue, &pkt, 0);
+
+        // Bump sender liveness — ECG packets count as "sender alive"
+        event_t ev = EV_RX_VITALS;
+        xQueueSend(event_queue, &ev, 0);
+        return;
+    }
+
     if (t == PACKET_TYPE_READY) {
         event_t ev = EV_RX_READY;
         xQueueSend(event_queue, &ev, 0);
@@ -145,28 +165,55 @@ static void on_data_received(const uint8_t *src_mac, const uint8_t *data,
 }
 
 // ============================================================
+// JSON helpers — NaN-aware float printing for vitals fields
+// ============================================================
+static void emit_float_field(const char *key, float v, bool last)
+{
+    if (isnan(v)) {
+        printf("\"%s\":null%s", key, last ? "" : ",");
+    } else {
+        printf("\"%s\":%.2f%s", key, v, last ? "" : ",");
+    }
+}
+
+// ============================================================
 // Serial output task — drains data_queue, emits {"type":"vitals", ...}
+// Floats serialise as JSON null when NaN (sensor failure / no body
+// contact) so the dashboard can show "no body contact" or just "—".
 // ============================================================
 static void serial_output_task(void *pv)
 {
     received_data_t rx;
     while (1) {
         if (xQueueReceive(data_queue, &rx, portMAX_DELAY) == pdTRUE) {
-            printf("{\"type\":\"vitals\","
-                   "\"node\":%d,"
-                   "\"hr\":%.1f,"
-                   "\"spo2\":%.1f,"
-                   "\"body_temp\":%.1f,"
-                   "\"env_temp\":%.1f,"
-                   "\"gas_ppm\":%.1f,"
-                   "\"rssi_master\":%d}\n",
-                   rx.packet.node_id,
-                   rx.packet.heart_rate,
-                   rx.packet.spo2,
-                   rx.packet.body_temp,
-                   rx.packet.env_temp,
-                   rx.packet.gas_ppm,
-                   rx.rssi);
+            printf("{\"type\":\"vitals\",");
+            printf("\"node\":%d,",         rx.packet.node_id);
+            printf("\"body_contact\":%d,", rx.packet.body_contact ? 1 : 0);
+            emit_float_field("hr",        rx.packet.heart_rate, false);
+            emit_float_field("spo2",      rx.packet.spo2,       false);
+            emit_float_field("body_temp", rx.packet.body_temp,  false);
+            emit_float_field("env_temp",  rx.packet.env_temp,   false);
+            emit_float_field("gas_ppm",   rx.packet.gas_ppm,    false);
+            printf("\"rssi_master\":%d}\n", rx.rssi);
+        }
+    }
+}
+
+// ============================================================
+// ECG output task — forwards batched ECG samples as JSON
+// ============================================================
+static void ecg_output_task(void *pv)
+{
+    ecg_packet_t pkt;
+    while (1) {
+        if (xQueueReceive(ecg_queue, &pkt, portMAX_DELAY) == pdTRUE) {
+            printf("{\"type\":\"ecg\",\"node\":%d,\"seq\":%u,\"samples\":[",
+                   pkt.node_id, pkt.seq);
+            for (int i = 0; i < ECG_SAMPLES_PER_PACKET; i++) {
+                printf("%u%s", pkt.samples[i],
+                       (i < ECG_SAMPLES_PER_PACKET - 1) ? "," : "");
+            }
+            printf("]}\n");
         }
     }
 }
@@ -244,6 +291,7 @@ static void state_task(void *pv)
     uint32_t last_connecting_emit = 0;
     uint32_t last_hb_tx_ms        = 0;
     uint32_t last_sender_seen_ms  = 0;
+    uint32_t last_ready_beacon_ms = 0;
 
     while (1) {
         event_t ev = EV_NONE;
@@ -332,6 +380,13 @@ static void state_task(void *pv)
             break;
 
         case MASTER_IDLE_NO_PEER:
+            // Beacon master_ready every few seconds so a dashboard that
+            // attaches after boot still picks up our state.
+            if (now - last_ready_beacon_ms >= READY_BEACON_MS) {
+                emit_status_global("master_ready");
+                last_ready_beacon_ms = now;
+            }
+            break;
         default:
             break;
         }
@@ -345,8 +400,9 @@ void app_main(void)
     onboard_led_init();
 
     data_queue  = xQueueCreate(20, sizeof(received_data_t));
+    ecg_queue   = xQueueCreate(16, sizeof(ecg_packet_t));
     event_queue = xQueueCreate(16, sizeof(event_t));
-    if (data_queue == NULL || event_queue == NULL) {
+    if (data_queue == NULL || ecg_queue == NULL || event_queue == NULL) {
         ESP_LOGE(TAG, "queue alloc failed");
         return;
     }
@@ -355,6 +411,7 @@ void app_main(void)
     espnow_comm_add_peer(SENDER1_MAC);
 
     xTaskCreate(serial_output_task, "serial_out",  4096, NULL, 5, NULL);
+    xTaskCreate(ecg_output_task,    "ecg_out",     4096, NULL, 5, NULL);
     xTaskCreate(uart_rx_task,       "uart_rx",     4096, NULL, 5, NULL);
     xTaskCreate(state_task,         "state",       4096, NULL, 6, NULL);
 

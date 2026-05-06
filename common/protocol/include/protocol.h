@@ -29,14 +29,16 @@
 // Sensor data packet sent from sender → master
 typedef struct __attribute__((packed))
 {
-    uint8_t packet_type; // PACKET_TYPE_SENSOR_DATA
-    uint8_t node_id;     // NODE_ID_SENDER_1 or NODE_ID_SENDER_2
-    float heart_rate;    // BPM from MAX30102
-    float spo2;          // % from MAX30102
-    float body_temp;     // Celsius from MAX30205
-    float env_temp;      // Celsius from TMP117
-    float gas_ppm;       // PPM from MQ-135
-    int8_t rssi_peer;    // RSSI of the other sender (-127 if unknown)
+    uint8_t packet_type;  // PACKET_TYPE_SENSOR_DATA
+    uint8_t node_id;      // NODE_ID_SENDER_1 or NODE_ID_SENDER_2
+    uint8_t body_contact; // 1 = MAX30102 detects finger/skin, 0 = no contact
+    uint8_t _pad;         // alignment for the floats below
+    float heart_rate;     // BPM from MAX30102, NaN when no contact / unreliable
+    float spo2;           // % from MAX30102, NaN when no contact / unreliable
+    float body_temp;      // Celsius — TMP117 broken on this PCB; sender fakes it
+    float env_temp;       // unused — NaN
+    float gas_ppm;        // unused — NaN
+    int8_t rssi_peer;     // unused in 1-sender prototype (-127)
 } sensor_packet_t;
 
 // Lightweight ping packet sent between senders for RSSI measurement (legacy)

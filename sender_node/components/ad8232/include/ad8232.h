@@ -12,9 +12,10 @@
 //
 // GPIO Configuration — update to match your PCB layout:
 // ============================================================
-#define AD8232_OUTPUT_ADC_CHANNEL   ADC_CHANNEL_6   // GPIO34 on ESP32 (input only, safe choice)
-#define AD8232_LO_PLUS_GPIO         32              // Leads-off detection positive
-#define AD8232_LO_MINUS_GPIO        33              // Leads-off detection negative
+#define AD8232_OUTPUT_ADC_CHANNEL   ADC_CHANNEL_6   // GPIO 34 on ESP32 (input-only)
+#define AD8232_LO_PLUS_GPIO         35              // GPIO 35 — input-only, leads-off positive
+#define AD8232_LO_MINUS_GPIO        32              // GPIO 32 — leads-off negative
+#define AD8232_SDN_GPIO             4               // GPIO 4 — chip-enable, must be HIGH
 
 // ADC resolution: 12-bit → 0–4095
 #define AD8232_ADC_WIDTH            ADC_WIDTH_BIT_12

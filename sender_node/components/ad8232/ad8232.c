@@ -65,19 +65,47 @@ esp_err_t ad8232_init(void)
         return ret;
     }
 
-    // --- Step 3: Configure LO+ GPIO (leads-off positive) ---
-    gpio_config_t lo_cfg = {
-        .pin_bit_mask = (1ULL << AD8232_LO_PLUS_GPIO) | (1ULL << AD8232_LO_MINUS_GPIO),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLDOWN_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,  // pull low; AD8232 drives HIGH when lead off
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
+    // --- Step 3: Configure leads-off detection pins ---
+    // GPIO 34..39 are input-only and have no internal pull-up/pull-down.
+    // AD8232's LO outputs are push-pull (actively drive HIGH/LOW), so we
+    // don't need pulls on these pins. We only enable pulls on GPIOs that
+    // physically support them.
+    {
+        const uint64_t no_pull_mask =
+            ((1ULL << 34) | (1ULL << 35) | (1ULL << 36) | (1ULL << 37) |
+             (1ULL << 38) | (1ULL << 39));
+        const uint64_t lo_plus_bit  = (1ULL << AD8232_LO_PLUS_GPIO);
+        const uint64_t lo_minus_bit = (1ULL << AD8232_LO_MINUS_GPIO);
 
-    ret = gpio_config(&lo_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "GPIO config for leads-off pins failed: %d", ret);
-        return ret;
+        gpio_config_t lo_input_only = {
+            .pin_bit_mask = (lo_plus_bit | lo_minus_bit) & no_pull_mask,
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config_t lo_with_pulldown = {
+            .pin_bit_mask = (lo_plus_bit | lo_minus_bit) & ~no_pull_mask,
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_ENABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+
+        if (lo_input_only.pin_bit_mask) {
+            ret = gpio_config(&lo_input_only);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "LO input-only GPIO config failed: %d", ret);
+                return ret;
+            }
+        }
+        if (lo_with_pulldown.pin_bit_mask) {
+            ret = gpio_config(&lo_with_pulldown);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "LO pulldown GPIO config failed: %d", ret);
+                return ret;
+            }
+        }
     }
 
     s_initialized = true;

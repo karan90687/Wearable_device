@@ -292,9 +292,8 @@ be added here in the future — no other master code change required.
   optional ECG live plot (matplotlib in a Tk canvas — Stage 4).
 
 ### Hardcoded MAC addresses
-- Sender MAC: `C0:CD:D6:CE:27:58` — hardcoded in `master_main.c` as `SENDER1_MAC`.
-- Master MAC: `9C:13:9E:90:C6:E0` — hardcoded in `sender_main.c` as `MASTER_MAC`.
-- Verify the actual MACs of the two DevKit V1 boards we'll use and update.
+- Sender MAC: `E0:8C:FE:32:DD:14` — hardcoded in `master_main.c` as `SENDER1_MAC`.
+- Master MAC: `C0:CD:D6:CE:27:58` — hardcoded in `sender_main.c` as `MASTER_MAC`.
 
 ---
 

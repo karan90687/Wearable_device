@@ -1,335 +1,335 @@
+/*
+ * MAX30102 driver — library form of the working maxi2c.c demo.
+ *
+ * The original maxi2c.c was a standalone ESP-IDF app (its own app_main, its
+ * own I²C init, its own scan). This file ports the same algorithms — beat
+ * detection, SpO2 calculation, FIFO read, die-temp read — into a clean
+ * library. The shared `hal/i2c.c` initialises the bus at 400 kHz; this
+ * driver only configures the chip itself.
+ *
+ * Public API in max30102.h:
+ *   max30102_init()              — chip init (call after i2c_init())
+ *   max30102_step(out)           — one polling tick at ~100 Hz; updates
+ *                                   internal state + fills the reading struct
+ *   max30102_read_die_temp()     — silicon temp, not body temp
+ *   max30102_read_sample(out)    — kept for test_main.c backward compat
+ *   filter_init / filter_update  — moving-average helpers (test_main.c uses)
+ */
+
 #include "max30102.h"
+
+#include <math.h>
+#include <string.h>
+
 #include "driver/i2c.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <string.h>
 
 static const char *TAG = "max30102";
 
-// forward declarations of helper functions
-esp_err_t max30102_read_reg(uint8_t reg, uint8_t *data, size_t len);
-esp_err_t max30102_write_reg(uint8_t reg, uint8_t data);
-esp_err_t max30102_read_sample(max30102_sample_t *sample);
-esp_err_t reset_registers();
-esp_err_t fifo_configure(uint8_t samples);
-esp_err_t spo2_configure(uint8_t adc, uint8_t sr, uint8_t pw);
-esp_err_t set_led_current(uint8_t red, uint8_t ir);
-esp_err_t set_mode_spo2();
-esp_err_t set_mode_heart_rate();
-esp_err_t set_mode_multi_led();
-esp_err_t reset_fifo();
-esp_err_t max30102_check_device();
-esp_err_t max30102_init();
- 
+// ─── I²C config (shared bus is brought up by hal/i2c.c at 400 kHz) ──
+#define MAX30102_I2C_PORT    I2C_NUM_0
+#define MAX30102_TIMEOUT_MS  1000
 
-esp_err_t max30102_check_device()
+// ─── Register map ───────────────────────────────────────────────────
+#define REG_INT_STATUS1     0x00
+#define REG_INT_STATUS2     0x01
+#define REG_INT_ENABLE1     0x02
+#define REG_INT_ENABLE2     0x03
+#define REG_FIFO_WR_PTR     0x04
+#define REG_OVF_COUNTER     0x05
+#define REG_FIFO_RD_PTR     0x06
+#define REG_FIFO_DATA       0x07
+#define REG_FIFO_CONFIG     0x08
+#define REG_MODE_CONFIG     0x09
+#define REG_SPO2_CONFIG     0x0A
+#define REG_LED1_PA         0x0C
+#define REG_LED2_PA         0x0D
+#define REG_TEMP_INT        0x1F
+#define REG_TEMP_FRAC       0x20
+#define REG_TEMP_CONFIG     0x21
+#define REG_PART_ID         0xFF
+
+// ─── Mode + SpO2 config values (same as maxi2c.c) ───────────────────
+#define MODE_SPO2           0x03
+#define SPO2_ADC_RGE        0x20   // 4096 nA
+#define SPO2_SR             0x04   // 100 sps
+#define SPO2_PW             0x03   // 411 µs
+#define FIFO_SMP_AVE        0x00
+#define FIFO_ROLLOVER_EN    0x10
+#define FIFO_A_FULL         0x0F
+
+// ─── Algorithm parameters (same as maxi2c.c standalone test) ────────
+// FINGER_THRESHOLD: IR must exceed this for body_contact = true.
+// 50000 was empirically validated on this hardware in standalone tests
+// (no finger → IR < 50000, finger on → IR > 56000).
+#define BUFFER_LEN          100
+#define FINGER_THRESHOLD    50000
+#define BEAT_HISTORY        4
+#define BEAT_AC_THRESHOLD   500.0f
+
+// ─── Internal state ─────────────────────────────────────────────────
+static uint32_t s_ir_buffer[BUFFER_LEN];
+static uint32_t s_red_buffer[BUFFER_LEN];
+static uint32_t s_sample_count = 0;
+
+static long    s_last_beat_time = 0;
+static float   s_bpm_history[BEAT_HISTORY] = {0};
+static uint8_t s_bpm_idx = 0;
+static float   s_avg_bpm = NAN;
+
+static float   s_ir_dc = 0;
+static float   s_prev_ac = 0;
+
+static float   s_last_spo2 = NAN;
+
+// ─── I²C helpers ────────────────────────────────────────────────────
+static esp_err_t i2c_write_reg(uint8_t reg, uint8_t value)
 {
-    uint8_t part_id;
-    esp_err_t ret;
-
-    ret = max30102_read_reg(0xFF, &part_id, 1);
-    if (ret != ESP_OK) return ret;
-
-    if (part_id != 0x15) {
-        return ESP_FAIL;
-    }
-
-    return ESP_OK;
+    uint8_t data[2] = {reg, value};
+    return i2c_master_write_to_device(
+        MAX30102_I2C_PORT, MAX30102_I2C_ADDR,
+        data, sizeof(data),
+        pdMS_TO_TICKS(MAX30102_TIMEOUT_MS));
 }
 
-esp_err_t max30102_init()
-{
-    // device check 
-esp_err_t reti = max30102_check_device();if (reti != ESP_OK) return reti;
-    // Step 1: reset : we will set the reset bit high
-
-esp_err_t ret;
-ret = reset_registers();
-if (ret != ESP_OK) return ret;    
-
-    // Step 2: configure FIFO
-    fifo_configure(0x50);     // 0x50 = 0101 0000 -> 4 samples, rollover enabled, A_FULL = 0
-
-    // Step 3: configure SPO2
-    spo2_configure(0x01, 0x02, 0x03);     // 0x5F = 0101 1111 -> ADC range = 4096 nA, sample rate = 100 Hz, pulse width = 411 µs
-
-    // Step 4: set LED current
-    set_led_current(0x24, 0x24);     // RED = 0x24 → ~7 mA, IR  = 0x24 → ~7 mA
-
-    // Step 5: set mode
-    set_mode_spo2();     // 0x03 = 0000 0011 → SpO2 mode, sensor ON, normal operation
-
-    
-    // Step 6: clear FIFO
-    reset_fifo();
-ESP_LOGI(TAG, "MAX30102 initialized successfully");
-    return ESP_OK;
-}
-
-esp_err_t fifo_configure(uint8_t samples){
-    /*
-[SMP_AVE][ROLLOVER][A_FULL]
-  010        1        0000
-
-Sample Averaging (SMP_AVE)
-👉 Reduces noise we will use 4 or 8 samples
-
-FIFO Rollover
-  👉 What happens when FIFO is full 
-0 → stop writing (data loss)
-1 → overwrite old data
-
-FIFO Almost Full (A_FULL)
-👉 When interrupt triggers (optional)
-Value = how many empty slots left
-for now Set to default (0 or small value) as we are not using interrupts
-*/
-
-    int ret = max30102_write_reg(0x08, samples);  
-    if (ret != ESP_OK) return ret;   
-    // max30102_write_reg(0x08, 0x78);     // 0x78 = 0111 1000 -> 8 samples, rollover enabled, A_FULL = 0
-    // max30102_write_reg(0x08, 0x50);     // 0x50 = 0101 0000 -> 4 samples, rollover enabled, A_FULL = 0
-    return ESP_OK;
-}
-
-esp_err_t spo2_configure(uint8_t adc, uint8_t sr, uint8_t pw){
-       /*
-| Bits | Field   | Meaning     |
-| ---- | ------- | ----------- |
-| 6:5  | ADC_RGE | ADC range   |
-| 4:2  | SR      | Sample rate |
-| 1:0  | LED_PW  | Pulse width |
-
-ADC Range (bits 6:5)
-Controls how strong signal can be before saturation.
-Options:
-2048 nA → high sensitivity
-4096 nA → balanced
-8192 nA → wider range
-16384 nA → very wide
-
-Sample Rate (bits 4:2)
-How many samples per second. {50,100,200,400,800,1000,1600,3200....} hz
-
-LED Pulse Width (bits 1:0)
-Controls: Resolution Measurement-time {69,118,215,411} µs.     high resolution better quality but more power 
-
-[ADC_RGE][SR][PW]
-   01      011  11
-*/
-uint8_t value = (adc << 5) | (sr << 2) | pw;
-    int ret = max30102_write_reg(0x0A, value);     // 0x5F = 0101 1111 -> ADC range = 4096 nA, sample rate = 100 Hz, pulse width = 411 µs
-    if (ret != ESP_OK) return ret;
-    return ESP_OK;
-
-}
-
-esp_err_t reset_registers()
-{
-    esp_err_t ret;
-    uint8_t val;
-
-    // Step 1: set reset bit (bit 6)
-    ret = max30102_write_reg(0x09, (1 << 6));
-    if (ret != ESP_OK) return ret;
-
-    // Step 2: poll until reset bit clears (auto-cleared by chip)
-    do {
-        vTaskDelay(pdMS_TO_TICKS(1));
-        max30102_read_reg(0x09, &val, 1);
-    } while (val & (1 << 6));
-
-    return ESP_OK;
-}
-
-esp_err_t set_led_current(uint8_t red_current, uint8_t ir_current){
-    /* 0x00 → LED OFF  
-0xFF → Maximum current 
-| Value | Current | Use              |
-| ----- | ------- | ---------------- |
-| 0x10  | ~3 mA   | Too low          |
-| 0x24  | ~7 mA   | Low              |
-| 0x3F  | ~12 mA  | Good             |
-| 0x7F  | ~25 mA  | Strong           |
-| 0xFF  | ~50 mA  | Too high (avoid) |
-
-for the stable reading 
-RED = 0x24 → ~7 mA  
-IR  = 0x24 → ~7 mA
-*/
-
-
-    // set LED current for RED and IR LEDs
-    int ret = max30102_write_reg(0x0C, red_current);     // LED1_PA (RED)
-    if (ret != ESP_OK) return ret;
-    ret = max30102_write_reg(0x0D, ir_current);      // LED2_PA (IR)
-    if (ret != ESP_OK) return ret;
-    return ESP_OK;
-}
-
-/*
-    | Mode Value | Name            | What it does            |
-| ---------- | --------------- | ----------------------- |
-| `010`      | Heart Rate Mode | Uses **IR LED only**    |
-| `011`      | SpO2 Mode       | Uses **RED + IR LEDs**  |
-| `111`      | Multi-LED Mode  | Flexible LED sequencing |
-
-*/
-esp_err_t set_mode_spo2(){
-        /*
-    MODE = 011 (SpO2 mode)
-    SHDN = 0 → sensor ON
-RESET = 0 → normal operation
-SHDN RESET  MODE
-  0     0    011
-  */
-int ret = max30102_write_reg(0x09, 0x03);     // 0x03 = 0000 0011 → SpO2 mode, sensor ON, normal operation
-    if (ret != ESP_OK) return ret;
-    return ESP_OK;
-}
-
-esp_err_t set_mode_heart_rate(){
-        /*
-    MODE = 010 (Heart Rate mode)
-    SHDN = 0 → sensor ON
-RESET = 0 → normal operation
-SHDN RESET  MODE
-  0     0    010
-  */
-int ret = max30102_write_reg(0x09, 0x02);     // 0x02 = 0000 0010 → Heart Rate mode, sensor ON, normal operation
-    if (ret != ESP_OK) return ret;
-    return ESP_OK;
-}
-
-esp_err_t set_mode_multi_led(){
-        /*
-    MODE = 111 (Multi-LED mode)
-    SHDN = 0 → sensor ON
-RESET = 0 → normal operation
-SHDN RESET  MODE
-  0     0    111
-  */
-int ret = max30102_write_reg(0x09, 0x07);     // 0x07 = 0000 0111 → Multi-LED mode, sensor ON, normal operation
-    if (ret != ESP_OK) return ret;
-    return ESP_OK;
-}
-
-esp_err_t reset_fifo(){
-    /*
-    To clear FIFO, we can reset the FIFO pointers and overflow counter:
-    FIFO_WR_PTR = 0
-    OVF_COUNTER = 0
-    FIFO_RD_PTR = 0
-    */
-    int ret;
-    ret = max30102_write_reg(0x04, 0x00);     // FIFO_WR_PTR
-    if (ret != ESP_OK) return ret;
-    ret = max30102_write_reg(0x05, 0x00);     // OVF_COUNTER
-    if (ret != ESP_OK) return ret;
-    ret = max30102_write_reg(0x06, 0x00);     // FIFO_RD_PTR
-    if (ret != ESP_OK) return ret;
-
-    return ESP_OK;
-}
-
-esp_err_t max30102_read_reg(uint8_t reg, uint8_t *data, size_t len)
+static esp_err_t i2c_read_reg(uint8_t reg, uint8_t *buf, size_t len)
 {
     return i2c_master_write_read_device(
-        I2C_NUM_0,
-        MAX30102_I2C_ADDR,
-        &reg,          // register address
-        1,
-        data,          //  buffer
-        len,           //  number of bytes
-        pdMS_TO_TICKS(100)
-    );
-}
-esp_err_t max30102_write_reg(uint8_t reg, uint8_t data)
-{
-    uint8_t buffer[2] = {reg, data};
-
-    return i2c_master_write_to_device(
-        I2C_NUM_0,
-        MAX30102_I2C_ADDR,
-        buffer,        //  buffer pointer
-        2,             //  length
-        pdMS_TO_TICKS(100)
-    );
+        MAX30102_I2C_PORT, MAX30102_I2C_ADDR,
+        &reg, 1,
+        buf, len,
+        pdMS_TO_TICKS(MAX30102_TIMEOUT_MS));
 }
 
-
-esp_err_t max30102_read_sample(max30102_sample_t *sample)
+// ─── Initialisation ─────────────────────────────────────────────────
+esp_err_t max30102_init(void)
 {
-    // NOTE: reads only one sample per call.
-// Caller must invoke this in a loop with task delay ≤ 10ms to keep up with 100Hz sample rate.
-// If called slower than 100Hz, FIFO will accumulate samples and rollover will silently overwrite old data.
-// TODO: replace with burst read (Option A) if data loss is observed.
+    // Reset all internal state — re-init must produce clean readings
+    memset(s_ir_buffer,  0, sizeof(s_ir_buffer));
+    memset(s_red_buffer, 0, sizeof(s_red_buffer));
+    s_sample_count    = 0;
+    s_last_beat_time  = 0;
+    s_bpm_idx         = 0;
+    s_avg_bpm         = NAN;
+    s_ir_dc           = 0;
+    s_prev_ac         = 0;
+    s_last_spo2       = NAN;
+    for (int i = 0; i < BEAT_HISTORY; i++) s_bpm_history[i] = 0;
 
-    uint8_t wr, rd;
-    uint8_t buffer[6];
-    esp_err_t ret;
+    uint8_t part_id = 0;
+    esp_err_t err = i2c_read_reg(REG_PART_ID, &part_id, 1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Part ID read failed: %d", err);
+        return err;
+    }
+    if (part_id != 0x15) {
+        ESP_LOGE(TAG, "Wrong Part ID: 0x%02X (expected 0x15)", part_id);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "MAX30102 found. Part ID: 0x%02X", part_id);
 
-    // Step 1: check FIFO
-    ret = max30102_read_reg(0x04, &wr, 1);
-    if (ret != ESP_OK) return ret;
+    // Soft reset — write reset bit, give the chip a moment
+    if (i2c_write_reg(REG_MODE_CONFIG, 0x40) != ESP_OK) return ESP_FAIL;
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    ret = max30102_read_reg(0x06, &rd, 1);
-    if (ret != ESP_OK) return ret;
+    // Clear FIFO pointers
+    if (i2c_write_reg(REG_FIFO_WR_PTR, 0x00) != ESP_OK) return ESP_FAIL;
+    if (i2c_write_reg(REG_OVF_COUNTER, 0x00) != ESP_OK) return ESP_FAIL;
+    if (i2c_write_reg(REG_FIFO_RD_PTR, 0x00) != ESP_OK) return ESP_FAIL;
 
-    uint8_t samples = (wr - rd) & 0x1F;
+    // FIFO config: no averaging, rollover enabled, almost-full @ 15 samples
+    if (i2c_write_reg(REG_FIFO_CONFIG,
+                      FIFO_SMP_AVE | FIFO_ROLLOVER_EN | FIFO_A_FULL) != ESP_OK)
+        return ESP_FAIL;
 
-    if (samples == 0) {
-        return ESP_ERR_NOT_FOUND;   // no data
+    // SpO2 mode (Red + IR)
+    if (i2c_write_reg(REG_MODE_CONFIG, MODE_SPO2) != ESP_OK) return ESP_FAIL;
+
+    // SpO2 config: ADC range 4096 nA, 100 sps, 411 µs pulse width
+    if (i2c_write_reg(REG_SPO2_CONFIG,
+                      SPO2_ADC_RGE | SPO2_SR | SPO2_PW) != ESP_OK)
+        return ESP_FAIL;
+
+    // LED currents — ~7.4 mA each, same as maxi2c.c demo
+    if (i2c_write_reg(REG_LED1_PA, 0x24) != ESP_OK) return ESP_FAIL;
+    if (i2c_write_reg(REG_LED2_PA, 0x24) != ESP_OK) return ESP_FAIL;
+
+    // Enable FIFO-almost-full interrupt (we don't read it, but matches demo)
+    if (i2c_write_reg(REG_INT_ENABLE1, 0x80) != ESP_OK) return ESP_FAIL;
+
+    ESP_LOGI(TAG, "MAX30102 initialised in SpO2 mode @ 100 sps");
+    return ESP_OK;
+}
+
+// ─── FIFO read ──────────────────────────────────────────────────────
+// SpO2 mode → 6 bytes per sample (Red 3B + IR 3B), 18-bit values
+static esp_err_t read_fifo_pair(uint32_t *red, uint32_t *ir)
+{
+    uint8_t raw[6];
+    esp_err_t err = i2c_read_reg(REG_FIFO_DATA, raw, 6);
+    if (err != ESP_OK) return err;
+
+    *red = ((uint32_t)(raw[0] & 0x03) << 16) |
+           ((uint32_t)raw[1] << 8) |
+            (uint32_t)raw[2];
+
+    *ir  = ((uint32_t)(raw[3] & 0x03) << 16) |
+           ((uint32_t)raw[4] << 8) |
+            (uint32_t)raw[5];
+    return ESP_OK;
+}
+
+// ─── Beat detection ─────────────────────────────────────────────────
+static bool detect_beat(uint32_t ir_value)
+{
+    float ir_f  = (float)ir_value;
+    s_ir_dc     = s_ir_dc * 0.99f + ir_f * 0.01f;
+    float ir_ac = ir_f - s_ir_dc;
+
+    bool beat = false;
+    if (s_prev_ac < BEAT_AC_THRESHOLD && ir_ac >= BEAT_AC_THRESHOLD) {
+        beat = true;
+    }
+    s_prev_ac = ir_ac;
+    return beat;
+}
+
+static void update_heart_rate(void)
+{
+    long now   = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    long delta = now - s_last_beat_time;
+    s_last_beat_time = now;
+
+    if (delta > 200 && delta < 3000) {  // valid 20–300 BPM
+        float bpm = 60000.0f / (float)delta;
+        s_bpm_history[s_bpm_idx++ % BEAT_HISTORY] = bpm;
+
+        float sum = 0;
+        for (int i = 0; i < BEAT_HISTORY; i++) sum += s_bpm_history[i];
+        s_avg_bpm = sum / BEAT_HISTORY;
+    }
+}
+
+// ─── SpO2 calculation ───────────────────────────────────────────────
+// R = (AC_red / DC_red) / (AC_ir / DC_ir);  SpO2 ≈ 110 - 25 * R
+static float compute_spo2(const uint32_t *red_buf, const uint32_t *ir_buf, int len)
+{
+    float red_mean = 0, ir_mean = 0;
+    for (int i = 0; i < len; i++) {
+        red_mean += red_buf[i];
+        ir_mean  += ir_buf[i];
+    }
+    red_mean /= len;
+    ir_mean  /= len;
+
+    float red_rms = 0, ir_rms = 0;
+    for (int i = 0; i < len; i++) {
+        float rd = (float)red_buf[i] - red_mean;
+        float id = (float)ir_buf[i]  - ir_mean;
+        red_rms += rd * rd;
+        ir_rms  += id * id;
+    }
+    red_rms = sqrtf(red_rms / len);
+    ir_rms  = sqrtf(ir_rms  / len);
+
+    if (ir_mean < 1 || ir_rms < 1) return NAN;
+
+    float R = (red_rms / red_mean) / (ir_rms / ir_mean);
+    float spo2 = 110.0f - 25.0f * R;
+    if (spo2 > 100.0f) spo2 = 100.0f;
+    if (spo2 < 80.0f)  return NAN;   // unreliable
+    return spo2;
+}
+
+// ─── Public step API ────────────────────────────────────────────────
+esp_err_t max30102_step(max30102_reading_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint32_t red = 0, ir = 0;
+    esp_err_t err = read_fifo_pair(&red, &ir);
+    if (err != ESP_OK) {
+        out->valid         = false;
+        out->ir            = 0;
+        out->red           = 0;
+        out->body_contact  = false;
+        out->beat_detected = false;
+        out->bpm           = s_avg_bpm;
+        out->spo2          = s_last_spo2;
+        return err;
     }
 
-    // Step 2: read FIFO
-    ret = max30102_read_reg(0x07, buffer, 6);
-    if (ret != ESP_OK) return ret;
+    s_ir_buffer [s_sample_count % BUFFER_LEN] = ir;
+    s_red_buffer[s_sample_count % BUFFER_LEN] = red;
+    s_sample_count++;
 
-    // Step 3: convert RED
-    sample->red = ((uint32_t)buffer[0] << 16) |
-                  ((uint32_t)buffer[1] << 8)  |
-                  (uint32_t)buffer[2];
-    sample->red &= 0x03FFFF;
+    bool finger = (ir > FINGER_THRESHOLD);
+    bool beat   = false;
+    if (finger) {
+        if (detect_beat(ir)) {
+            update_heart_rate();
+            beat = true;
+        }
+    } else {
+        // Lost contact — drop HR confidence so we don't display stale numbers
+        s_avg_bpm  = NAN;
+    }
 
-    // Step 4: convert IR
-    sample->ir = ((uint32_t)buffer[3] << 16) |
-                 ((uint32_t)buffer[4] << 8)  |
-                 (uint32_t)buffer[5];
-    sample->ir &= 0x03FFFF;
+    // Recompute SpO2 every BUFFER_LEN samples while finger is on
+    if (finger && s_sample_count > 0 && (s_sample_count % BUFFER_LEN == 0)) {
+        float v = compute_spo2(s_red_buffer, s_ir_buffer, BUFFER_LEN);
+        if (!isnan(v)) {
+            s_last_spo2 = v;
+        }
+    }
+    if (!finger) s_last_spo2 = NAN;
 
+    out->ir            = ir;
+    out->red           = red;
+    out->body_contact  = finger;
+    out->beat_detected = beat;
+    out->bpm           = s_avg_bpm;
+    out->spo2          = s_last_spo2;
+    out->valid         = true;
     return ESP_OK;
+}
+
+// ─── Die temperature (silicon, not body) ────────────────────────────
+float max30102_read_die_temp(void)
+{
+    if (i2c_write_reg(REG_TEMP_CONFIG, 0x01) != ESP_OK) return NAN;
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    uint8_t temp_int = 0, temp_frac = 0;
+    if (i2c_read_reg(REG_TEMP_INT,  &temp_int,  1) != ESP_OK) return NAN;
+    if (i2c_read_reg(REG_TEMP_FRAC, &temp_frac, 1) != ESP_OK) return NAN;
+
+    return (float)(int8_t)temp_int + (temp_frac * 0.0625f);
+}
+
+// ─── Backward-compat surface used by test_main.c ────────────────────
+esp_err_t max30102_read_sample(max30102_sample_t *sample)
+{
+    if (sample == NULL) return ESP_ERR_INVALID_ARG;
+    return read_fifo_pair(&sample->red, &sample->ir);
 }
 
 void filter_init(moving_avg_filter_t *f)
 {
     memset(f->buffer, 0, sizeof(f->buffer));
-    f->sum = 0;
+    f->sum   = 0;
     f->index = 0;
     f->count = 0;
 }
 
 uint32_t filter_update(moving_avg_filter_t *f, uint32_t new_value)
 {
-    // remove old value
     f->sum -= f->buffer[f->index];
-
-    // insert new value
     f->buffer[f->index] = new_value;
     f->sum += new_value;
-
-    // move index
     f->index = (f->index + 1) % FILTER_SIZE;
-
-    // track count (for initial phase)
-    if (f->count < FILTER_SIZE) {
-        f->count++;
-    }
-
-    // return average
+    if (f->count < FILTER_SIZE) f->count++;
     return f->sum / f->count;
 }
-
-
-
